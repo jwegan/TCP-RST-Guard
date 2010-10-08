@@ -1,0 +1,25 @@
+          TCP RST GUARD
+
+Introduction:
+
+    TCP RST Guard is an experimental TCP option for preventing RST/FIN
+attacks on established TCP connections. RST/FIN attack prevention is crucial
+due to their ability to compromise the underlying internet routing
+infrastructure of BGP routers. TCP RST Guard improves upon previous mechanisms
+due to the fact it is backwards compatible, requires no changes to the basic
+functioning of the TCP protocol, and only incurs overhead on connection setup
+and teardown. 
+
+Documentation:
+
+    TCP_RST_Guard_-_draft.pdf is a paper detailing the reasoning behind 
+TCP RST Guard as well as the proposed protocol, security analysis and 
+evaluation of our implementation of the protocol in the Linux kernel.
+
+Code:
+
+    linux/linux-2.6.32 contains the source code for release 2.6.32 of the linux
+kernel modified to support TCP RST Guard.
+    linux/rst_guard_patch is a patch to the linux kernel containing the changes
+to implement TCP RST Guard. 
+
