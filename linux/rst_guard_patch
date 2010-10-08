@@ -1,0 +1,981 @@
+diff -uprN -X linux-2.6.32/Documentation/dontdiff linux-2.6.32/include/linux/tcp.h linux/include/linux/tcp.h
+--- linux-2.6.32/include/linux/tcp.h	2009-12-02 19:51:21.000000000 -0800
++++ linux/include/linux/tcp.h	2009-12-06 18:28:09.878039497 -0800
+@@ -96,6 +96,7 @@ enum { 
+ #define TCP_QUICKACK		12	/* Block/reenable quick acks */
+ #define TCP_CONGESTION		13	/* Congestion control algorithm */
+ #define TCP_MD5SIG		14	/* TCP MD5 Signature (RFC2385) */
++#define TCP_RSTGUARD		15
+ 
+ #define TCPI_OPT_TIMESTAMPS	1
+ #define TCPI_OPT_SACK		2
+@@ -170,6 +171,15 @@ struct tcp_md5sig {
+ 	__u8	tcpm_key[TCP_MD5SIG_MAXKEYLEN];		/* key (binary) */
+ };
+ 
++struct tcp_rg_data {
++	__u64 	nonce_value;
++	__u64 	hash_value;
++
++	__u8 	b_use_guard;
++	__u8	b_passed_check;
++	__u8	nonce_set;
++};
++
+ #ifdef __KERNEL__
+ 
+ #include <linux/skbuff.h>
+@@ -221,6 +231,7 @@ struct tcp_options_received {
+ 	u8	num_sacks;	/* Number of SACK blocks		*/
+ 	u16	user_mss;  	/* mss requested by user in ioctl */
+ 	u16	mss_clamp;	/* Maximal mss, negotiated at connection setup */
++	struct tcp_rg_data rguard; /* TCP RESET GUARD */
+ };
+ 
+ /* This is the max number of SACKS that we'll generate and process. It's safe
+@@ -379,6 +390,8 @@ struct tcp_sock {
+ 
+ 	int			linger2;
+ 
++	struct tcp_rg_data rguard; /* TCP RESET GUARD */
++
+ /* Receiver side RTT estimation */
+ 	struct {
+ 		u32	rtt;
+@@ -424,6 +437,7 @@ struct tcp_timewait_sock {
+ 	u16			  tw_md5_keylen;
+ 	u8			  tw_md5_key[TCP_MD5SIG_MAXKEYLEN];
+ #endif
++	struct tcp_rg_data	rguard;
+ };
+ 
+ static inline struct tcp_timewait_sock *tcp_twsk(const struct sock *sk)
+diff -uprN -X linux-2.6.32/Documentation/dontdiff linux-2.6.32/include/net/tcp.h linux/include/net/tcp.h
+--- linux-2.6.32/include/net/tcp.h	2009-12-02 19:51:21.000000000 -0800
++++ linux/include/net/tcp.h	2009-12-06 18:28:09.878039497 -0800
+@@ -167,6 +167,7 @@ extern void tcp_time_wait(struct sock *s
+ #define TCPOPT_SACK             5       /* SACK Block */
+ #define TCPOPT_TIMESTAMP	8	/* Better RTT estimations/PAWS */
+ #define TCPOPT_MD5SIG		19	/* MD5 Signature (RFC2385) */
++#define TCPOPT_RSTGUARD		29	/* RST GUARD option */
+ 
+ /*
+  *     TCP option lengths
+@@ -177,6 +178,8 @@ extern void tcp_time_wait(struct sock *s
+ #define TCPOLEN_SACK_PERM      2
+ #define TCPOLEN_TIMESTAMP      10
+ #define TCPOLEN_MD5SIG         18
++#define TCPOLEN_RSTGUARD8        10
++#define TCPOLEN_RSTGUARD16       18
+ 
+ /* But this is what stacks really send out. */
+ #define TCPOLEN_TSTAMP_ALIGNED		12
+@@ -187,6 +190,9 @@ extern void tcp_time_wait(struct sock *s
+ #define TCPOLEN_SACK_PERBLOCK		8
+ #define TCPOLEN_MD5SIG_ALIGNED		20
+ #define TCPOLEN_MSS_ALIGNED		4
++#define TCPOLEN_RSTGUARD8_ALIGNED	12
++#define TCPOLEN_RSTGUARD16_ALIGNED	20
++
+ 
+ /* Flags in tp->nonagle */
+ #define TCP_NAGLE_OFF		1	/* Nagle's algo is disabled */
+@@ -410,7 +416,7 @@ extern int			tcp_recvmsg(struct kiocb *i
+ extern void			tcp_parse_options(struct sk_buff *skb,
+ 						  struct tcp_options_received *opt_rx,
+ 						  int estab);
+-
++extern u8			*tcp_parse_rguard_option(struct tcphdr *th);
+ extern u8			*tcp_parse_md5sig_option(struct tcphdr *th);
+ 
+ /*
+diff -uprN -X linux-2.6.32/Documentation/dontdiff linux-2.6.32/net/ipv4/Makefile linux/net/ipv4/Makefile
+--- linux-2.6.32/net/ipv4/Makefile	2009-12-02 19:51:21.000000000 -0800
++++ linux/net/ipv4/Makefile	2009-12-06 18:28:09.878039497 -0800
+@@ -11,7 +11,7 @@ obj-y     := route.o inetpeer.o protocol
+ 	     datagram.o raw.o udp.o udplite.o \
+ 	     arp.o icmp.o devinet.o af_inet.o  igmp.o \
+ 	     fib_frontend.o fib_semantics.o \
+-	     inet_fragment.o
++	     inet_fragment.o rg_crypto.o
+ 
+ obj-$(CONFIG_SYSCTL) += sysctl_net_ipv4.o
+ obj-$(CONFIG_IP_FIB_HASH) += fib_hash.o
+diff -uprN -X linux-2.6.32/Documentation/dontdiff linux-2.6.32/net/ipv4/rg_crypto.c linux/net/ipv4/rg_crypto.c
+--- linux-2.6.32/net/ipv4/rg_crypto.c	1969-12-31 16:00:00.000000000 -0800
++++ linux/net/ipv4/rg_crypto.c	2009-12-06 18:28:09.878039497 -0800
+@@ -0,0 +1,400 @@
++/*
++ * File Name: rg_cypto.c
++ * Description: Implements the cyptographic primatives for the
++ *		RST Guard TCP extension
++ * Author: John Egan & Ricky Ghov
++ * Last Modified: Dec 6, 2009
++ */
++
++#include <linux/types.h>
++#include <linux/stat.h>
++#include <linux/fcntl.h>
++#include <linux/unistd.h>
++#include <linux/stat.h>
++#include <linux/kernel.h>
++#include <linux/fs.h>
++#include <asm/byteorder.h>
++#include "rg_crypto.h"
++
++/* kernel includes */
++#include <linux/syscalls.h>
++#include <asm/msr.h>
++#include <asm/uaccess.h>
++#include <linux/string.h>
++#include <linux/file.h>
++#include <crypto/hash.h>
++#include <linux/err.h>
++#include <linux/module.h>
++#include <linux/scatterlist.h>
++#include <linux/slab.h>
++#include <crypto/rng.h>
++
++#define XBUFSIZE 8
++
++struct tcrypt_result {
++	struct completion completion;
++	int err;
++};
++
++
++static void tcrypt_complete(struct crypto_async_request *req, int err)
++{
++	struct tcrypt_result *res = req->data;
++
++	if (err == -EINPROGRESS)
++		return;
++
++	res->err = err;
++	complete(&res->completion);
++}
++
++
++static int testmgr_alloc_buf(char *buf[XBUFSIZE])
++{
++	int i;
++
++	for (i = 0; i < XBUFSIZE; i++) {
++		buf[i] = (void *)__get_free_page(GFP_KERNEL);
++		if (!buf[i])
++			goto err_free_buf;
++	}
++
++	return 0;
++err_free_buf:
++	while (i-- > 0)
++		free_page((unsigned long)buf[i]);
++	
++	return -ENOMEM;
++}
++
++static void testmgr_free_buf(char *buf[XBUFSIZE])
++{
++	int i;
++
++	for (i = 0; i < XBUFSIZE; i++)
++		free_page((unsigned long)buf[i]);
++}
++
++
++
++/*
++ * Method Name: rg_getNonce
++ * Description: Returns a 64 bit random value by returning the first 64 bits
++ *		by hashing the current cycle counter using sha512
++ */
++__u64 rg_get_nonce()
++{
++	char result[64];
++	__u64 return_value;
++	__u64 time = native_read_tsc();
++	struct crypto_ahash * tfm;
++	struct scatterlist sg[8];
++	struct ahash_request *req;
++	struct tcrypt_result tresult;
++	void *hash_buff;
++	char *xbuf[XBUFSIZE];
++	int ret = -ENOMEM;
++
++	tfm = crypto_alloc_ahash("sha512",0,0);
++	if(IS_ERR(tfm)) {
++		printk(KERN_ERR "alg: hash: Failed to load transform for hmac(sha512)");
++		return 0;
++	}
++
++	if (testmgr_alloc_buf(xbuf)){
++		crypto_free_ahash(tfm);
++		return 0;
++	}
++	init_completion(&tresult.completion);
++	req = ahash_request_alloc(tfm, GFP_KERNEL);
++	if (!req) {
++		printk(KERN_ERR "alg: rg_get_nonce Failed to allocate request "
++			"for sha512");
++		crypto_free_ahash(tfm);
++		ahash_request_free(req);
++		testmgr_free_buf(xbuf);
++		return 0;
++	}
++	ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
++				   tcrypt_complete, &tresult);
++	memset(result, 0, 64);
++	hash_buff = xbuf[0];
++	ret = -EINVAL;
++	memcpy(hash_buff, &time, sizeof (__u64));
++	sg_init_one(&sg[0], hash_buff, sizeof (__u64));
++	ahash_request_set_crypt(req, sg, result, sizeof(__u64));
++	ret = crypto_ahash_digest(req);
++	switch (ret) {
++		case 0:
++			break;
++		case -EINPROGRESS:
++		case -EBUSY:
++			ret = wait_for_completion_interruptible(
++				&tresult.completion);
++			if (!ret && !(ret = tresult.err)) {
++				INIT_COMPLETION(tresult.completion);
++				break;
++			}
++
++		default:
++			printk(KERN_ERR "alg: hash: digest failed "
++				"for sha512: ret=%d\n", -ret);
++			crypto_free_ahash(tfm);
++			ahash_request_free(req);
++			testmgr_free_buf(xbuf);
++			return 0;
++			
++	}
++	memcpy(&return_value,result,sizeof(__u64));
++	crypto_free_ahash(tfm);
++	ahash_request_free(req);
++	testmgr_free_buf(xbuf);
++	return return_value;
++}
++
++/*
++ * Method Name: rg_getUniqueID
++ * Description: Should retrieve the unique ID if it exists, otherwise
++ *		generates a random unique id for this computer and
++ *		stores it in the file .tcp_rg_uid. By default look in 
++ *		/etc/tcp_rg_uid for it.
++ * Return Value: The unique id in a 64 bit unsigned integer in
++ *		 big endian order
++ */
++char *uidfname = "/etc/tcp_rg_uid";
++__u64 rg_get_unique_id()
++{
++	int fp;
++	__u64 uid = 0;
++
++	mm_segment_t fs = get_fs();
++	set_fs(KERNEL_DS);
++	
++	fp = sys_open(uidfname, O_RDONLY, 0644);
++	if (fp < 0) {
++		fp = sys_open(uidfname, O_WRONLY | O_CREAT, 0644);
++
++		if (fp < 0) {
++			return 42;
++		}
++		uid = rg_get_nonce();
++		sys_write(fp, &uid, sizeof (__u64));
++	} else {
++		sys_read(fp, &uid, sizeof (__u64));
++	}
++	sys_close(fp);
++	set_fs(fs);
++	return uid; 
++}
++
++/*
++ * Method Name: rg_calcSecretValue
++ * Arguments: (all in big endian order)
++ *		__u32 nonce - The nonce value
++ *		__u32 loc_ip - My ip address
++ *		__u32 loc_port - My port
++ *		__u32 rmt_up - The remote ip address
++ *		__u32 rmt_port - The remote port
++ * Return Value: The s value in big endian order
++ */
++__u64 rg_calc_secret_value(__u64 nonce, __u32 loc_ip, __u32 loc_port, __u32 rmt_ip,
++		     __u32 rmt_port)
++{
++	__u32 message[6];
++	char result[64];
++	__u64 return_value;
++	__u64 uid = rg_get_unique_id();
++	struct crypto_ahash * tfm;
++	struct scatterlist sg[8];
++	struct ahash_request *req;
++	struct tcrypt_result tresult;
++	void *hash_buff;
++	char *xbuf[XBUFSIZE];
++	int ret = -ENOMEM;
++
++	tfm = crypto_alloc_ahash("hmac(sha512)",0,0);
++	if(IS_ERR(tfm)) {
++		printk(KERN_ERR "alg: hash: Failed to load transform for hmac(sha512)");
++		return 0;
++	}
++
++	
++	if (testmgr_alloc_buf(xbuf)){
++		crypto_free_ahash(tfm);
++		return 0;
++	}
++
++	init_completion(&tresult.completion);
++	
++	req = ahash_request_alloc(tfm, GFP_KERNEL);
++	if (!req) {
++		printk(KERN_ERR "alg: rg_calc_secret_value Failed to allocate request "
++			"for sha512");
++		crypto_free_ahash(tfm);
++		testmgr_free_buf(xbuf);
++		return 0;
++	}
++	ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
++				   tcrypt_complete, &tresult);
++
++	memset(result, 0, 64);
++	hash_buff = xbuf[0];
++	ret = -EINVAL;
++	memcpy(message, &nonce, sizeof (__u64));
++	message[2] = loc_ip;
++	message[3] = loc_port;
++	message[4] = rmt_ip;
++	message[5] = rmt_port;
++	memcpy(hash_buff, message, sizeof (__u32) * 6);
++	sg_init_one(&sg[0], hash_buff, sizeof (__u32) * 6);
++	crypto_ahash_clear_flags(tfm, ~0);
++	ret = crypto_ahash_setkey(tfm, &uid, sizeof(__u64));
++	if (ret) {
++		printk(KERN_ERR "alg: hash: setkey failed "
++			"for hmac(sha512): ret=%d\n",-ret);
++		crypto_free_ahash(tfm);
++		ahash_request_free(req);
++		testmgr_free_buf(xbuf);
++		return 0;
++	}
++
++	ahash_request_set_crypt(req, sg, result, sizeof (__u32) * 6);
++	ret = crypto_ahash_digest(req);
++
++	switch (ret) {
++		case 0:
++			break;
++		case -EINPROGRESS:
++		case -EBUSY:
++			ret = wait_for_completion_interruptible(
++				&tresult.completion);
++			if (!ret && !(ret = tresult.err)) {
++				INIT_COMPLETION(tresult.completion);
++				break;
++			}
++
++		default:
++			printk(KERN_ERR "alg: hash: digest failed "
++				"for hmac(sha512): ret=%d\n", -ret);
++			crypto_free_ahash(tfm);
++			ahash_request_free(req);
++			testmgr_free_buf(xbuf);
++			return 0;
++			
++	}
++
++	memcpy(&return_value,result,sizeof(__u64));
++	crypto_free_ahash(tfm);
++	ahash_request_free(req);
++	testmgr_free_buf(xbuf);
++
++	return return_value;
++
++}
++
++/*
++ * Method Name: rg_calcConnHash
++ * Arguments: (all in big endian order)
++ *		__u64 svalue - The secret value
++ *		__u32 nonce - The nonce value
++ *		__u32 loc_ip - My ip address (if calculating my hash)
++ *		__u32 loc_port - My port (if calculating my hash)
++ *		__u32 rmt_up - The remote ip address
++ *		__u32 rmt_port - The remote port
++ * Return Value: The s value in big endian order
++ */
++__u64 rg_calc_conn_hash(__u64 svalue, __u64 nonce, __u32 loc_ip, __u32 loc_port,
++		  __u32 rmt_ip, __u32 rmt_port)
++{
++	__u32 message[6];
++	char result[64];
++	__u64 return_value;
++	struct crypto_ahash * tfm;
++	struct scatterlist sg[8];
++	struct ahash_request *req;
++	struct tcrypt_result tresult;
++	void *hash_buff;
++	char *xbuf[XBUFSIZE];
++	int ret = -ENOMEM;
++
++	tfm = crypto_alloc_ahash("hmac(sha512)",0,0);
++	
++	if(IS_ERR(tfm)) {
++		printk(KERN_ERR "alg: hash: Failed to load transform for hmac(sha512)");
++		return 0;
++	}
++	
++	if (testmgr_alloc_buf(xbuf)){
++		crypto_free_ahash(tfm);
++		return 0;
++	}
++	
++	init_completion(&tresult.completion);
++	req = ahash_request_alloc(tfm, GFP_KERNEL);
++	if (!req) {
++		printk(KERN_ERR "alg: rg_calc_secret_value Failed to allocate request "
++			"for sha512");
++		crypto_free_ahash(tfm);
++		testmgr_free_buf(xbuf);
++		return 0;
++	}
++	ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
++				   tcrypt_complete, &tresult);
++
++
++	memset(result, 0, 64);
++	hash_buff = xbuf[0];
++
++	ret = -EINVAL;
++	
++	memcpy(message, &nonce, sizeof (__u64));
++	message[2] = loc_ip;
++	message[3] = loc_port;
++	message[4] = rmt_ip;
++	message[5] = rmt_port;
++	memcpy(hash_buff, message, sizeof (__u32) * 6);
++	sg_init_one(&sg[0], hash_buff, sizeof (__u32) * 6);
++
++	crypto_ahash_clear_flags(tfm, ~0);
++	ret = crypto_ahash_setkey(tfm, &svalue, sizeof(__u64));
++	if (ret) {
++		printk(KERN_ERR "alg: hash: setkey failed "
++			"for hmac(sha512): ret=%d\n", -ret);
++		crypto_free_ahash(tfm);
++		ahash_request_free(req);
++		testmgr_free_buf(xbuf);
++		return 0;
++	}
++	ahash_request_set_crypt(req, sg, result, sizeof (__u32) * 6);
++	ret = crypto_ahash_digest(req);
++
++	switch (ret) {
++		case 0:
++			break;
++		case -EINPROGRESS:
++		case -EBUSY:
++			ret = wait_for_completion_interruptible(
++				&tresult.completion);
++			if (!ret && !(ret = tresult.err)) {
++				INIT_COMPLETION(tresult.completion);
++				break;
++			}
++
++		default:
++			printk(KERN_ERR "alg: hash: digest failed "
++				"for hmac(sha512): ret=%d\n", -ret);
++			crypto_free_ahash(tfm);
++			ahash_request_free(req);
++			testmgr_free_buf(xbuf);
++			return 0;
++			
++	}
++
++	memcpy(&return_value, result, sizeof(__u64));
++	crypto_free_ahash(tfm);
++	ahash_request_free(req);
++	testmgr_free_buf(xbuf);
++	return return_value;
++
++}
++
+diff -uprN -X linux-2.6.32/Documentation/dontdiff linux-2.6.32/net/ipv4/rg_crypto.h linux/net/ipv4/rg_crypto.h
+--- linux-2.6.32/net/ipv4/rg_crypto.h	1969-12-31 16:00:00.000000000 -0800
++++ linux/net/ipv4/rg_crypto.h	2009-12-06 18:28:09.878039497 -0800
+@@ -0,0 +1,26 @@
++/*
++ * File Name: rg_crypto.h
++ * Author: John Egan
++ * Last Modified: May 6, 2009
++ * Description: Header file for crypto primatives for RST Guard
++ */
++
++#ifndef _RP_CRYPTO_H
++#define _RP_CRYPTO_H
++
++#include <linux/types.h>
++
++__u64 rg_get_nonce(void);
++__u64 rg_get_unique_id(void);
++__u64 rg_calc_secret_value(__u64 nonce, __u32 loc_ip, __u32 loc_port,
++			   __u32 rmt_ip, __u32 rmt_port);
++__u64 rg_calc_conn_hash(__u64 svalue, __u64 nonce, __u32 loc_ip, __u32 loc_port,
++			__u32 rmt_ip, __u32 rmt_port);
++
++/* DEBUG */
++/* #define __RG_DEBUG */
++#ifdef __RG_DEBUG
++void rg_print_debug(char *string);
++#endif
++
++#endif
+diff -uprN -X linux-2.6.32/Documentation/dontdiff linux-2.6.32/net/ipv4/syncookies.c linux/net/ipv4/syncookies.c
+--- linux-2.6.32/net/ipv4/syncookies.c	2009-12-02 19:51:21.000000000 -0800
++++ linux/net/ipv4/syncookies.c	2009-12-06 18:28:09.878039497 -0800
+@@ -277,8 +277,10 @@ struct sock *cookie_v4_check(struct sock
+ 	NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_SYNCOOKIESRECV);
+ 
+ 	/* check for timestamp cookie support */
+-	memset(&tcp_opt, 0, sizeof(tcp_opt));
++	memset(&tcp_opt, 0, sizeof (tcp_opt));
++	memcpy(&(tp->rx_opt.rguard), &(tp->rguard), sizeof (tp->rguard));
+ 	tcp_parse_options(skb, &tcp_opt, 0);
++	memcpy(&(tp->rguard), &(tp->rx_opt.rguard), sizeof (tp->rguard));
+ 
+ 	if (tcp_opt.saw_tstamp)
+ 		cookie_check_timestamp(&tcp_opt);
+diff -uprN -X linux-2.6.32/Documentation/dontdiff linux-2.6.32/net/ipv4/tcp.c linux/net/ipv4/tcp.c
+--- linux-2.6.32/net/ipv4/tcp.c	2009-12-02 19:51:21.000000000 -0800
++++ linux/net/ipv4/tcp.c	2009-12-06 18:28:09.878039497 -0800
+@@ -2247,7 +2247,10 @@ static int do_tcp_setsockopt(struct sock
+ 		err = tp->af_specific->md5_parse(sk, optval, optlen);
+ 		break;
+ #endif
+-
++	case TCP_RSTGUARD:
++		tp->rguard.b_use_guard = 1;
++		tp->rguard.nonce_set = 0;
++		break;
+ 	default:
+ 		err = -ENOPROTOOPT;
+ 		break;
+diff -uprN -X linux-2.6.32/Documentation/dontdiff linux-2.6.32/net/ipv4/tcp_input.c linux/net/ipv4/tcp_input.c
+--- linux-2.6.32/net/ipv4/tcp_input.c	2009-12-02 19:51:21.000000000 -0800
++++ linux/net/ipv4/tcp_input.c	2009-12-06 18:28:09.878039497 -0800
+@@ -71,6 +71,7 @@
+ #include <linux/ipsec.h>
+ #include <asm/unaligned.h>
+ #include <net/netdma.h>
++#include "rg_crypto.h"
+ 
+ int sysctl_tcp_timestamps __read_mostly = 1;
+ int sysctl_tcp_window_scaling __read_mostly = 1;
+@@ -3703,6 +3704,7 @@ void tcp_parse_options(struct sk_buff *s
+ 	unsigned char *ptr;
+ 	struct tcphdr *th = tcp_hdr(skb);
+ 	int length = (th->doff * 4) - sizeof(struct tcphdr);
++	int rst_guard_entered = 0;
+ 
+ 	ptr = (unsigned char *)(th + 1);
+ 	opt_rx->saw_tstamp = 0;
+@@ -3774,6 +3776,75 @@ void tcp_parse_options(struct sk_buff *s
+ 					TCP_SKB_CB(skb)->sacked = (ptr - 2) - (unsigned char *)th;
+ 				}
+ 				break;
++			case TCPOPT_RSTGUARD:
++				rst_guard_entered = 1;
++				if ((opsize == TCPOLEN_RSTGUARD16)) {
++					/* reset on with S and N sent */
++					if (th->rst || th->fin) {
++						__u64 s_val;
++						memcpy(&s_val, ptr,
++						       sizeof (__u64));
++						if (opt_rx->rguard.nonce_set ==
++						    0) {
++							memcpy(&
++							       (opt_rx->
++								rguard.nonce_value),
++							       ptr + 8,
++							       sizeof (__u64));
++							opt_rx->
++							    rguard.nonce_set =
++							    1;
++						}
++
++						struct iphdr *ip_head =
++						    ip_hdr(skb);
++						__u64 hash_val =
++						    rg_calc_conn_hash(s_val,
++								      opt_rx->rguard.nonce_value,
++								      ip_head->saddr,
++								      th->
++								      source,
++								      ip_head->daddr,
++								      th->dest);
++						if (hash_val ==
++						    opt_rx->rguard.hash_value)
++							opt_rx->
++							    rguard.b_passed_check
++							    = 1;
++						else
++							opt_rx->
++							    rguard.b_passed_check
++							    = 0;
++
++					} else {
++						/* syn and syn-ack */
++						memcpy(&
++						       (opt_rx->
++							rguard.hash_value), ptr,
++						       sizeof (__u64));
++						/*opt_rx->rguard.hashValue = 0;get_unaligned_be64(ptr);*/
++						if (th->syn && !th->ack) {
++							memcpy(&
++							       (opt_rx->
++								rguard.nonce_value),
++							       ptr + 8,
++							       sizeof (__u64));
++							opt_rx->
++							    rguard.nonce_set =
++							    1;
++						}
++					}
++					/* Nonce value added to acks and sending of data in established connection */
++				} else if (opsize == TCPOLEN_RSTGUARD8) {
++					if (opt_rx->rguard.nonce_set == 0) {
++						memcpy(&
++						       (opt_rx->
++							rguard.nonce_value),
++						       ptr, sizeof (__u64));
++						opt_rx->rguard.nonce_set = 1;
++					}
++				}
++				break;
+ #ifdef CONFIG_TCP_MD5SIG
+ 			case TCPOPT_MD5SIG:
+ 				/*
+@@ -3788,6 +3859,10 @@ void tcp_parse_options(struct sk_buff *s
+ 			length -= opsize;
+ 		}
+ 	}
++	if (((th->syn && th->ack) || (th->syn)) && (rst_guard_entered == 0)
++	    && (opt_rx->rguard.b_use_guard == 1)) {
++		opt_rx->rguard.b_use_guard = 0;
++	}
+ }
+ 
+ static int tcp_parse_aligned_timestamp(struct tcp_sock *tp, struct tcphdr *th)
+@@ -3820,10 +3895,40 @@ static int tcp_fast_parse_options(struct
+ 		if (tcp_parse_aligned_timestamp(tp, th))
+ 			return 1;
+ 	}
++	memcpy(&(tp->rx_opt.rguard), &(tp->rguard), sizeof (tp->rguard));
+ 	tcp_parse_options(skb, &tp->rx_opt, 1);
++	memcpy(&(tp->rguard), &(tp->rx_opt.rguard), sizeof (tp->rguard));
+ 	return 1;
+ }
+ 
++u8 *tcp_parse_rguard_option(struct tcphdr * th)
++{
++	int length = (th->doff << 2) - sizeof (*th);
++	u8 *ptr = (u8 *) (th + 1);
++	/*printk(KERN_ERR "in tcp_parse_rguard_option!\n"); */
++	while (length > 0) {
++		int opcode = *ptr++;
++		int opsize;
++
++		switch (opcode) {
++		case TCPOPT_EOL:
++			return NULL;
++		case TCPOPT_NOP:
++			length--;
++			continue;
++		default:
++			opsize = *ptr++;
++			if (opsize < 2 || opsize > length)
++				return NULL;
++			if (opcode == TCPOPT_RSTGUARD)
++				return ptr;
++		}
++		ptr += opsize - 2;
++		length -= opsize;
++	}
++	return NULL;
++}
++
+ #ifdef CONFIG_TCP_MD5SIG
+ /*
+  * Parse MD5 Signature option
+@@ -5082,6 +5187,10 @@ static int tcp_validate_incoming(struct 
+ 		}
+ 		/* Reset is accepted even if it did not pass PAWS. */
+ 	}
++	if (tp->rguard.b_use_guard && (th->rst || th->fin)
++	    && !tp->rguard.b_passed_check) {
++		goto discard;
++	}
+ 
+ 	/* Step 1: check sequence number */
+ 	if (!tcp_sequence(tp, TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq)) {
+@@ -5365,7 +5474,9 @@ static int tcp_rcv_synsent_state_process
+ 	struct inet_connection_sock *icsk = inet_csk(sk);
+ 	int saved_clamp = tp->rx_opt.mss_clamp;
+ 
++	memcpy(&(tp->rx_opt.rguard), &(tp->rguard), sizeof (tp->rguard));
+ 	tcp_parse_options(skb, &tp->rx_opt, 0);
++	memcpy(&(tp->rguard), &(tp->rx_opt.rguard), sizeof (tp->rguard));
+ 
+ 	if (th->ack) {
+ 		/* rfc793:
+diff -uprN -X linux-2.6.32/Documentation/dontdiff linux-2.6.32/net/ipv4/tcp_ipv4.c linux/net/ipv4/tcp_ipv4.c
+--- linux-2.6.32/net/ipv4/tcp_ipv4.c	2009-12-02 19:51:21.000000000 -0800
++++ linux/net/ipv4/tcp_ipv4.c	2009-12-06 18:28:09.878039497 -0800
+@@ -80,6 +80,7 @@
+ 
+ #include <linux/crypto.h>
+ #include <linux/scatterlist.h>
++#include "rg_crypto.h"
+ 
+ int sysctl_tcp_tw_reuse __read_mostly;
+ int sysctl_tcp_low_latency __read_mostly;
+@@ -604,7 +605,24 @@ static void tcp_v4_send_reset(struct soc
+ 	memset(&arg, 0, sizeof(arg));
+ 	arg.iov[0].iov_base = (unsigned char *)&rep;
+ 	arg.iov[0].iov_len  = sizeof(rep.th);
++	__u8 *rguard_opt = tcp_parse_rguard_option(th);
++	if (rguard_opt != NULL) {
++		rep.opt[0] = htonl((TCPOPT_NOP << 24) |
++				   (TCPOPT_NOP << 16) |
++				   (TCPOPT_RSTGUARD << 8) | TCPOLEN_RSTGUARD16);
++		arg.iov[0].iov_len += TCPOLEN_RSTGUARD16_ALIGNED;
++		rep.th.doff = arg.iov[0].iov_len / 4;
+ 
++		__u64 *nonce =
++		    (__u64 *) ((*(rguard_opt - 1) == TCPOLEN_RSTGUARD16) ?
++			       rguard_opt + 8 : rguard_opt);
++		struct iphdr *ip_head = ip_hdr(skb);
++		__u64 svalue =
++		    rg_calc_secret_value(*nonce, ip_head->daddr, th->dest,
++					 ip_head->saddr, th->source);
++		memcpy(&rep.opt[1], &svalue, sizeof (__u64));
++		memcpy(&rep.opt[3], nonce, sizeof (__u64));
++	}
+ #ifdef CONFIG_TCP_MD5SIG
+ 	key = sk ? tcp_v4_md5_do_lookup(sk, ip_hdr(skb)->daddr) : NULL;
+ 	if (key) {
+@@ -1260,7 +1278,10 @@ int tcp_v4_conn_request(struct sock *sk,
+ 	tmp_opt.mss_clamp = 536;
+ 	tmp_opt.user_mss  = tcp_sk(sk)->rx_opt.user_mss;
+ 
++	struct tcp_sock *tp = tcp_sk(sk);
++	memcpy(&tmp_opt.rguard, &tp->rguard, sizeof (tp->rguard));
+ 	tcp_parse_options(skb, &tmp_opt, 0);
++	memcpy(&tp->rguard, &tmp_opt.rguard, sizeof (tp->rguard));
+ 
+ 	if (want_cookie && !tmp_opt.saw_tstamp)
+ 		tcp_clear_options(&tmp_opt);
+@@ -1811,7 +1832,7 @@ static int tcp_v4_init_sock(struct sock 
+ 	tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
+ 	tp->snd_cwnd_clamp = ~0;
+ 	tp->mss_cache = 536;
+-
++	memset(&tp->rguard, 0, sizeof (struct tcp_rg_data));
+ 	tp->reordering = sysctl_tcp_reordering;
+ 	icsk->icsk_ca_ops = &tcp_init_congestion_ops;
+ 
+diff -uprN -X linux-2.6.32/Documentation/dontdiff linux-2.6.32/net/ipv4/tcp_minisocks.c linux/net/ipv4/tcp_minisocks.c
+--- linux-2.6.32/net/ipv4/tcp_minisocks.c	2009-12-02 19:51:21.000000000 -0800
++++ linux/net/ipv4/tcp_minisocks.c	2009-12-06 18:28:09.878039497 -0800
+@@ -102,8 +102,9 @@ tcp_timewait_state_process(struct inet_t
+ 
+ 	tmp_opt.saw_tstamp = 0;
+ 	if (th->doff > (sizeof(*th) >> 2) && tcptw->tw_ts_recent_stamp) {
++		memcpy(&tmp_opt.rguard, &tcptw->rguard, sizeof (tcptw->rguard));
+ 		tcp_parse_options(skb, &tmp_opt, 0);
+-
++		memcpy(&tcptw->rguard, &tmp_opt.rguard, sizeof (tcptw->rguard));
+ 		if (tmp_opt.saw_tstamp) {
+ 			tmp_opt.ts_recent	= tcptw->tw_ts_recent;
+ 			tmp_opt.ts_recent_stamp	= tcptw->tw_ts_recent_stamp;
+@@ -285,6 +286,7 @@ void tcp_time_wait(struct sock *sk, int 
+ 
+ 	if (tw != NULL) {
+ 		struct tcp_timewait_sock *tcptw = tcp_twsk((struct sock *)tw);
++		tcptw->rguard = tp->rguard;
+ 		const int rto = (icsk->icsk_rto << 2) - (icsk->icsk_rto >> 1);
+ 
+ 		tw->tw_rcv_wscale	= tp->rx_opt.rcv_wscale;
+@@ -503,7 +505,10 @@ struct sock *tcp_check_req(struct sock *
+ 
+ 	tmp_opt.saw_tstamp = 0;
+ 	if (th->doff > (sizeof(struct tcphdr)>>2)) {
++		struct tcp_sock *tp = tcp_sk(sk);
++		memcpy(&tmp_opt.rguard, &tp->rguard, sizeof (tp->rguard));
+ 		tcp_parse_options(skb, &tmp_opt, 0);
++		memcpy(&tp->rguard, &tmp_opt.rguard, sizeof (tp->rguard));
+ 
+ 		if (tmp_opt.saw_tstamp) {
+ 			tmp_opt.ts_recent = req->ts_recent;
+diff -uprN -X linux-2.6.32/Documentation/dontdiff linux-2.6.32/net/ipv4/tcp_output.c linux/net/ipv4/tcp_output.c
+--- linux-2.6.32/net/ipv4/tcp_output.c	2009-12-02 19:51:21.000000000 -0800
++++ linux/net/ipv4/tcp_output.c	2009-12-06 18:35:42.095515029 -0800
+@@ -38,6 +38,7 @@
+ 
+ #include <linux/compiler.h>
+ #include <linux/module.h>
++#include "rg_crypto.h"
+ 
+ /* People can turn this off for buggy TCP's found in printers etc. */
+ int sysctl_tcp_retrans_collapse __read_mostly = 1;
+@@ -362,6 +363,7 @@ static inline int tcp_urg_mode(const str
+ #define OPTION_TS		(1 << 1)
+ #define OPTION_MD5		(1 << 2)
+ #define OPTION_WSCALE		(1 << 3)
++#define OPTION_RSTGUARD		(1 << 4)
+ 
+ struct tcp_out_options {
+ 	u8 options;		/* bit field of OPTION_* */
+@@ -369,6 +371,9 @@ struct tcp_out_options {
+ 	u8 num_sack_blocks;	/* number of SACK blocks to include */
+ 	u16 mss;		/* 0 to disable */
+ 	__u32 tsval, tsecr;	/* need to include OPTION_TS */
++	__u8 rst_option;		/* RST GUARD option */
++	__u64 hash_value;	/* RST GUARD V to send */
++	__u64 nonce_value;	/* RST GUARD Nonce value used */
+ };
+ 
+ /* Write previously computed TCP options to the packet.
+@@ -403,7 +408,21 @@ static void tcp_options_write(__be32 *pt
+ 			       (TCPOLEN_MSS << 16) |
+ 			       opts->mss);
+ 	}
++	if ((OPTION_RSTGUARD & opts->options) != 0) {
++		*ptr++ = htonl((TCPOPT_NOP << 24) |
++			       (TCPOPT_NOP << 16) |
++			       (TCPOPT_RSTGUARD << 8) | opts->rst_option);
+ 
++		if (opts->rst_option == TCPOLEN_RSTGUARD16) {
++			memcpy(ptr, &opts->hash_value, sizeof (__u64));
++			ptr += 2;
++			memcpy(ptr, &opts->nonce_value, sizeof (__u64));
++			ptr += 2;
++		} else {
++			memcpy(ptr, &opts->nonce_value, sizeof (__u64));
++			ptr += 2;
++		}
++	}
+ 	if (likely(OPTION_TS & opts->options)) {
+ 		if (unlikely(OPTION_SACK_ADVERTISE & opts->options)) {
+ 			*ptr++ = htonl((TCPOPT_SACK_PERM << 24) |
+@@ -461,7 +480,8 @@ static void tcp_options_write(__be32 *pt
+  */
+ static unsigned tcp_syn_options(struct sock *sk, struct sk_buff *skb,
+ 				struct tcp_out_options *opts,
+-				struct tcp_md5sig_key **md5) {
++				struct tcp_md5sig_key **md5,
++				struct inet_sock *inet) {
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 	unsigned size = 0;
+ 
+@@ -503,6 +523,22 @@ static unsigned tcp_syn_options(struct s
+ 		if (unlikely(!(OPTION_TS & opts->options)))
+ 			size += TCPOLEN_SACKPERM_ALIGNED;
+ 	}
++	if (tp->rguard.b_use_guard) {
++		opts->options |= OPTION_RSTGUARD;
++		opts->rst_option = TCPOLEN_RSTGUARD16;
++		size += TCPOLEN_RSTGUARD16_ALIGNED;
++
++		opts->nonce_value = rg_get_nonce();
++		tp->rguard.nonce_value = opts->nonce_value;
++		tp->rguard.nonce_set = 1;
++		__u64 svalue =
++		    rg_calc_secret_value(tp->rguard.nonce_value, inet->saddr,
++					 inet->sport,
++					 inet->daddr, inet->dport);
++		opts->hash_value =
++		    rg_calc_conn_hash(svalue, opts->nonce_value, inet->saddr,
++				      inet->sport, inet->daddr, inet->dport);
++	}
+ 
+ 	return size;
+ }
+@@ -516,6 +552,7 @@ static unsigned tcp_synack_options(struc
+ 	unsigned size = 0;
+ 	struct inet_request_sock *ireq = inet_rsk(req);
+ 	char doing_ts;
++	struct tcp_sock *tp = tcp_sk(sk);
+ 
+ #ifdef CONFIG_TCP_MD5SIG
+ 	*md5 = tcp_rsk(req)->af_specific->md5_lookup(sk, req);
+@@ -552,6 +589,22 @@ static unsigned tcp_synack_options(struc
+ 		if (unlikely(!doing_ts))
+ 			size += TCPOLEN_SACKPERM_ALIGNED;
+ 	}
++	if (tp->rguard.b_use_guard) {
++		/*printk(KERN_ERR "in tcp_syn_ack!\n"); */
++		opts->options |= OPTION_RSTGUARD;
++		opts->rst_option = TCPOLEN_RSTGUARD16;
++		size += TCPOLEN_RSTGUARD16_ALIGNED;
++
++		opts->nonce_value = tp->rguard.nonce_value;
++		__u64 svalue =
++		    rg_calc_secret_value(opts->nonce_value, ireq->loc_addr,
++					 ireq->loc_port,
++					 ireq->rmt_addr, ireq->rmt_port);
++		opts->hash_value =
++		    rg_calc_conn_hash(svalue, opts->nonce_value, ireq->loc_addr,
++				      ireq->loc_port, ireq->rmt_addr,
++				      ireq->rmt_port);
++	}
+ 
+ 	return size;
+ }
+@@ -594,6 +647,32 @@ static unsigned tcp_established_options(
+ 		size += TCPOLEN_SACK_BASE_ALIGNED +
+ 			opts->num_sack_blocks * TCPOLEN_SACK_PERBLOCK;
+ 	}
++	if (tp->rguard.b_use_guard) {
++		/*printk(KERN_ERR "in tcp_established_options!\n"); */
++		opts->options |= OPTION_RSTGUARD;
++		opts->nonce_value = tp->rguard.nonce_value;
++
++		if (tcb == NULL) {
++			/* Was called from tcp_current_mss so we have to be conservative
++			   and estimate the worst case size */
++			opts->rst_option = TCPOLEN_RSTGUARD16;
++			size += TCPOLEN_RSTGUARD16_ALIGNED;
++		} else if (tcb != NULL
++			   && (tcb->flags & TCPCB_FLAG_FIN
++			       || tcb->flags & TCPCB_FLAG_RST)) {
++			opts->rst_option = TCPOLEN_RSTGUARD16;
++			size += TCPOLEN_RSTGUARD16_ALIGNED;
++
++			struct inet_sock *inet = inet_sk(sk);
++			opts->hash_value =
++			    rg_calc_secret_value(opts->nonce_value, inet->saddr,
++						 inet->sport, inet->daddr,
++						 inet->dport);
++		} else {
++			opts->rst_option = TCPOLEN_RSTGUARD8;
++			size += TCPOLEN_RSTGUARD8_ALIGNED;
++		}
++	}
+ 
+ 	return size;
+ }
+@@ -646,7 +725,7 @@ static int tcp_transmit_skb(struct sock 
+ 	memset(&opts, 0, sizeof(opts));
+ 
+ 	if (unlikely(tcb->flags & TCPCB_FLAG_SYN))
+-		tcp_options_size = tcp_syn_options(sk, skb, &opts, &md5);
++		tcp_options_size = tcp_syn_options(sk, skb, &opts, &md5, inet);
+ 	else
+ 		tcp_options_size = tcp_established_options(sk, skb, &opts,
+ 							   &md5);
